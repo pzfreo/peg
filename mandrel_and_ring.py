@@ -125,6 +125,66 @@ def build_ring(
     return ring.part
 
 
+def build_pip(
+    shaft_od: float = 1.5,
+    shaft_length: float = 2.0,
+    head_od: float = 4.2,
+    head_length: float = 3.3,
+    fillet_pct: float = 0.75,
+) -> "Part":
+    """Build a decorative pip: shaft cylinder topped by a squashed spheroid.
+
+    The spheroid is made by creating a cylinder and filleting the top edges
+    to the maximum radius, producing a rounded head.
+    """
+    shaft_radius = shaft_od / 2
+    head_radius = head_od / 2
+
+    with BuildPart() as pip:
+        # Shaft cylinder
+        Cylinder(
+            radius=shaft_radius,
+            height=shaft_length,
+            align=(Align.CENTER, Align.CENTER, Align.MIN),
+        )
+        # Head cylinder on top of shaft
+        with Locations([(0, 0, shaft_length)]):
+            Cylinder(
+                radius=head_radius,
+                height=head_length,
+                align=(Align.CENTER, Align.CENTER, Align.MIN),
+            )
+        # Fillet the top edges of the head to create a squashed spheroid
+        top_edges = [
+            e for e in pip.part.edges()
+            if abs(e.center().Z - (shaft_length + head_length)) < 0.01
+        ]
+        for e in top_edges:
+            try:
+                r = e.radius
+            except ValueError:
+                continue
+            if r is not None and r > shaft_radius + 0.01:
+                max_r = pip.part.max_fillet([e])
+                fillet([e], radius=max_r * fillet_pct)
+
+        # Fillet the bottom edges of the head too
+        bottom_edges = [
+            e for e in pip.part.edges()
+            if abs(e.center().Z - shaft_length) < 0.01
+        ]
+        for e in bottom_edges:
+            try:
+                r = e.radius
+            except ValueError:
+                continue
+            if r is not None and r > shaft_radius + 0.01:
+                max_r = pip.part.max_fillet([e])
+                fillet([e], radius=max_r * fillet_pct)
+
+    return pip.part
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Generate 3D-printable mandrel and decorative ring."
@@ -136,6 +196,12 @@ def main():
     parser.add_argument("--fillet-radius", type=float, default=0.4, help="Fillet radius as proportion of segment height (default: 0.4)")
     parser.add_argument("--groove-od", type=float, default=None, help="Groove OD in mm (default: midpoint of bore and small OD)")
     parser.add_argument("--no-small-flare", action="store_true", help="Disable small ring flare (default: flare enabled)")
+    # Pip parameters
+    parser.add_argument("--pip-shaft-od", type=float, default=1.5, help="Pip shaft OD in mm (default: 1.5)")
+    parser.add_argument("--pip-shaft-length", type=float, default=3.0, help="Pip shaft length in mm (default: 3.0)")
+    parser.add_argument("--pip-head-od", type=float, default=4.2, help="Pip head OD in mm (default: 4.2)")
+    parser.add_argument("--pip-head-length", type=float, default=3.3, help="Pip head length in mm (default: 3.3)")
+    parser.add_argument("--pip-fillet-pct", type=float, default=0.75, help="Pip fillet as fraction of max (default: 0.75)")
     # Mandrel parameters
     parser.add_argument("--mandrel-dia", type=float, default=9.0, help="Mandrel cylinder diameter in mm (default: 9.0)")
     parser.add_argument("--mandrel-cyl-length", type=float, default=25.0, help="Mandrel cylinder length in mm (default: 25.0)")
@@ -168,9 +234,18 @@ def main():
         small_flare=not args.no_small_flare,
     )
 
+    pip = build_pip(
+        shaft_od=args.pip_shaft_od,
+        shaft_length=args.pip_shaft_length,
+        head_od=args.pip_head_od,
+        head_length=args.pip_head_length,
+        fillet_pct=args.pip_fillet_pct,
+    )
+
     # Export STL files
     export_stl(mandrel, "mandrel.stl")
     export_stl(ring, "ring.stl")
+    export_stl(pip, "pip.stl")
 
     # Print summary
     outer_dia = args.ring_id + 2 * args.ring_thickness
@@ -189,14 +264,17 @@ def main():
     print(f"  Height     = {actual_height:.2f}mm" + (f"  (flared, truncated from {args.ring_height:.2f}mm)" if small_flare else ""))
     print(f"  Fillet     = {args.fillet_radius} × seg height")
     print(f"  Small flare = {'on' if small_flare else 'off'}")
-    print("Exported: mandrel.stl, ring.stl")
+    print(f"Pip:")
+    print(f"  Shaft      = {args.pip_shaft_od:.2f}mm OD × {args.pip_shaft_length:.2f}mm")
+    print(f"  Head       = {args.pip_head_od:.2f}mm OD × {args.pip_head_length:.2f}mm (filleted spheroid)")
+    print("Exported: mandrel.stl, ring.stl, pip.stl")
 
     # Show in ocp_vscode if available
     if not args.no_view:
         try:
             from ocp_vscode import show
 
-            show(mandrel, ring, names=["Mandrel", "Ring"], colors=["steelblue", "gold"])
+            show(mandrel, ring, pip, names=["Mandrel", "Ring", "Pip"], colors=["steelblue", "gold", "coral"])
             print("Displayed in OCP viewer")
         except Exception:
             print("OCP viewer not available, skipping display")
