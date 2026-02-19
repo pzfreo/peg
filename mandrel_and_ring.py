@@ -197,7 +197,7 @@ def main():
     parser.add_argument("--groove-od", type=float, default=None, help="Groove OD in mm (default: midpoint of bore and small OD)")
     parser.add_argument("--no-small-flare", action="store_true", help="Disable small ring flare (default: flare enabled)")
     # Pip parameters
-    parser.add_argument("--pip-shaft-od", type=float, default=1.5, help="Pip shaft OD in mm (default: 1.5)")
+    parser.add_argument("--pip-shaft-od", type=float, default=2.0, help="Pip shaft OD in mm (default: 2.0)")
     parser.add_argument("--pip-shaft-length", type=float, default=3.0, help="Pip shaft length in mm (default: 3.0)")
     parser.add_argument("--pip-head-od", type=float, default=4.2, help="Pip head OD in mm (default: 4.2)")
     parser.add_argument("--pip-head-length", type=float, default=3.3, help="Pip head length in mm (default: 3.3)")
