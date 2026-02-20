@@ -207,6 +207,9 @@ def main():
     parser.add_argument("--mandrel-cyl-length", type=float, default=25.0, help="Mandrel cylinder length in mm (default: 25.0)")
     parser.add_argument("--taper-end-dia", type=float, default=8.0, help="Taper end diameter in mm (default: 8.0)")
     parser.add_argument("--taper-length", type=float, default=30.0, help="Taper length in mm (default: 30.0)")
+    # Multi-colour 3MF export
+    parser.add_argument("--layer-height", type=float, default=None, help="Layer height in mm; when set, exports ring.3mf and pip.3mf with alternating colours")
+    parser.add_argument("--colors", nargs="+", default=["#FF0000", "#0000FF"], help='Hex colours for alternating layers (default: "#FF0000" "#0000FF")')
     # Display
     parser.add_argument("--no-view", action="store_true", help="Skip ocp_vscode display")
 
@@ -267,7 +270,17 @@ def main():
     print(f"Pip:")
     print(f"  Shaft      = {args.pip_shaft_od:.2f}mm OD × {args.pip_shaft_length:.2f}mm")
     print(f"  Head       = {args.pip_head_od:.2f}mm OD × {args.pip_head_length:.2f}mm (filleted spheroid)")
-    print("Exported: mandrel.stl, ring.stl, pip.stl")
+    exported = ["mandrel.stl", "ring.stl", "pip.stl"]
+
+    # Multi-colour 3MF export
+    if args.layer_height is not None:
+        from export_3mf import export_multicolor_3mf
+
+        export_multicolor_3mf(ring, "ring.3mf", args.layer_height, args.colors)
+        export_multicolor_3mf(pip, "pip.3mf", args.layer_height, args.colors)
+        exported.extend(["ring.3mf", "pip.3mf"])
+
+    print(f"Exported: {', '.join(exported)}")
 
     # Show in ocp_vscode if available
     if not args.no_view:
