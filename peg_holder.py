@@ -31,7 +31,7 @@ def build_holder(
     taper_ratio: float,
     length: float,
     wall_thickness: float,
-    label_depth: float = 1.0,
+    label_depth: float = 2.0,
 ) -> "Part":
     """Build a peg holder: plain cylinder with tapered bore.
 
@@ -102,12 +102,12 @@ def main():
         wall_thickness=args.wall_thickness,
     )
 
-    export_stl(holder, "peg_holder.stl")
-
     # Print summary
-    small_r = args.small_end_dia / 2
     large_dia = args.small_end_dia + args.length / args.taper_ratio
     outer_dia = large_dia + 2 * args.wall_thickness
+
+    filename = f"peg_holder_1-{args.taper_ratio:.0f}_{args.small_end_dia:.1f}mm.stl"
+    export_stl(holder, filename)
 
     print("Peg Holder:")
     print(f"  Length       = {args.length:.2f}mm")
@@ -115,7 +115,7 @@ def main():
     print(f"  Small end ID = {args.small_end_dia:.2f}mm")
     print(f"  Large end ID = {large_dia:.2f}mm")
     print(f"  Outer dia    = {outer_dia:.2f}mm  (wall {args.wall_thickness:.2f}mm)")
-    print("Exported: peg_holder.stl")
+    print(f"Exported: {filename}")
 
     if not args.no_view:
         try:
