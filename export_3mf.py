@@ -1,15 +1,125 @@
 """Export build123d parts as multi-color 3MF files with alternating layer colors.
 
-Each triangle in the tessellated mesh is assigned a material based on which
-print layer its Z centroid falls in.  When opened in Bambu Studio the
-per-triangle colours map to AMS filament slots, giving alternating layer
-colours without manual painting.
+Produces a single manifold mesh (via STL round-trip through OCCT) and writes
+per-triangle paint_color attributes into the 3MF XML.  These are read
+natively by OrcaSlicer and Bambu Studio as filament painting data.
 """
 
 import argparse
-import math
+import os
+import tempfile
+import xml.etree.ElementTree as ET
+import zipfile
 
 import lib3mf
+
+
+def _hex_to_rgb(hex_str: str) -> tuple[int, int, int]:
+    """Convert '#RRGGBB' to (R, G, B) ints."""
+    h = hex_str.lstrip("#")
+    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+
+
+def _encode_paint_color(extruder_idx: int) -> str:
+    """Encode an extruder index (0-based) as a paint_color hex string.
+
+    BambuStudio/OrcaSlicer TriangleSelector bitstream format (4 bits):
+      bits[0:1] = 00  (leaf node marker)
+      bits[2:3] = state  (1=Extruder1, 2=Extruder2, ...)
+    Reassembled as hex: (state << 2).
+      Extruder 0 → "4", Extruder 1 → "8"
+    """
+    state = extruder_idx + 1
+    return format(state << 2, "X")
+
+
+def _read_stl_mesh(stl_path):
+    """Read an STL file via lib3mf, return (vertices, faces) lists."""
+    wrapper = lib3mf.get_wrapper()
+    reader_model = wrapper.CreateModel()
+    reader = reader_model.QueryReader("stl")
+    reader.ReadFromFile(stl_path)
+
+    obj_iter = reader_model.GetMeshObjects()
+    if not obj_iter.MoveNext():
+        raise RuntimeError(f"No mesh found in {stl_path}")
+    stl_mesh = obj_iter.GetCurrentMeshObject()
+
+    vert_count = stl_mesh.GetVertexCount()
+    tri_count = stl_mesh.GetTriangleCount()
+    return (
+        [stl_mesh.GetVertex(i) for i in range(vert_count)],
+        [stl_mesh.GetTriangle(i) for i in range(tri_count)],
+    )
+
+
+def _write_basic_3mf(vertices, faces, out_path):
+    """Write a plain single-mesh 3MF (no materials) via lib3mf."""
+    wrapper = lib3mf.get_wrapper()
+    model = wrapper.CreateModel()
+    mesh = model.AddMeshObject()
+    mesh.SetName("part")
+    mesh.SetGeometry(vertices, faces)
+    model.AddBuildItem(mesh, wrapper.GetIdentityTransform())
+    writer = model.QueryWriter("3mf")
+    writer.WriteToFile(out_path)
+
+
+def _compute_tri_colors(vertices, faces, layer_height, num_colors):
+    """Return list of 0-based color index per triangle, by Z centroid."""
+    result = []
+    for t in faces:
+        v0 = vertices[t.Indices[0]]
+        v1 = vertices[t.Indices[1]]
+        v2 = vertices[t.Indices[2]]
+        z = (v0.Coordinates[2] + v1.Coordinates[2] + v2.Coordinates[2]) / 3.0
+        layer_idx = int(z / layer_height)
+        result.append(layer_idx % num_colors)
+    return result
+
+
+NS_3MF = "http://schemas.microsoft.com/3dmanufacturing/core/2015/02"
+
+
+def _inject_paint_colors(tmf_path, tri_colors, out_path):
+    """Post-process a 3MF: add paint_color attrs to triangles."""
+    with zipfile.ZipFile(tmf_path, "r") as zin:
+        model_xml = zin.read("3D/3dmodel.model")
+        other_files = {}
+        for name in zin.namelist():
+            if name != "3D/3dmodel.model":
+                other_files[name] = zin.read(name)
+
+    # Register the 3MF default namespace so ET doesn't add ns0: prefixes
+    ET.register_namespace("", NS_3MF)
+    # Preserve other namespaces lib3mf may have written
+    for prefix, uri in [
+        ("m", "http://schemas.microsoft.com/3dmanufacturing/material/2015/02"),
+        ("p", "http://schemas.microsoft.com/3dmanufacturing/production/2015/06"),
+    ]:
+        ET.register_namespace(prefix, uri)
+
+    root = ET.fromstring(model_xml)
+
+    # Add paint_color attribute to each triangle
+    tri_idx = 0
+    for tri_elem in root.iter(f"{{{NS_3MF}}}triangle"):
+        if tri_idx < len(tri_colors):
+            color_idx = tri_colors[tri_idx]
+            tri_elem.set("paint_color", _encode_paint_color(color_idx))
+            tri_idx += 1
+
+    # Add BambuStudio painting version metadata
+    meta = ET.SubElement(root, f"{{{NS_3MF}}}metadata")
+    meta.set("name", "BambuStudio:MmPaintingVersion")
+    meta.text = "0"
+
+    new_xml = ET.tostring(root, encoding="unicode", xml_declaration=True)
+
+    with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as zout:
+        zout.writestr("3D/3dmodel.model", new_xml)
+        for name, data in other_files.items():
+            zout.writestr(name, data)
 
 
 def export_multicolor_3mf(
@@ -17,94 +127,40 @@ def export_multicolor_3mf(
     filename: str,
     layer_height: float,
     colors: list[str] | None = None,
-    tolerance: float = 0.01,
 ) -> None:
     """Export a build123d Part as a 3MF with alternating layer colours.
 
+    Uses STL round-trip for a manifold mesh, then injects per-triangle
+    paint_color attributes for native OrcaSlicer/Bambu Studio support.
+
     Args:
-        part: A build123d Part (or Shape with a tessellate method).
+        part: A build123d Part (or Shape).
         filename: Output .3mf file path.
         layer_height: Print layer height in mm.
         colors: Hex colour strings (e.g. ["#FF0000", "#0000FF"]).
                 Defaults to red and blue if not supplied.
-        tolerance: Tessellation tolerance passed to Part.tessellate().
     """
     if colors is None:
         colors = ["#FF0000", "#0000FF"]
     if len(colors) < 2:
         raise ValueError("Need at least two colours for alternating layers")
 
-    # Tessellate the part
-    vertices, faces = part.tessellate(tolerance)
+    from build123d import export_stl
 
-    # Build 3MF model
-    wrapper = lib3mf.get_wrapper()
-    model = wrapper.CreateModel()
-    mesh = model.AddMeshObject()
-    mesh.SetName("part")
+    with tempfile.NamedTemporaryFile(suffix=".stl", delete=False) as tmp:
+        tmp_stl = tmp.name
+    export_stl(part, tmp_stl)
 
-    # Add vertices
-    vert_buf = []
-    for v in vertices:
-        pos = lib3mf.Position()
-        pos.Coordinates[0] = float(v.X)
-        pos.Coordinates[1] = float(v.Y)
-        pos.Coordinates[2] = float(v.Z)
-        vert_buf.append(pos)
-    mesh.SetGeometry(vert_buf, [])  # set vertices first, triangles below
+    vertices, faces = _read_stl_mesh(tmp_stl)
+    os.unlink(tmp_stl)
 
-    # Create material group with colours
-    mat_group = model.AddBaseMaterialGroup()
-    mat_indices = []
-    for i, hex_color in enumerate(colors):
-        r, g, b = _hex_to_rgb(hex_color)
-        color = wrapper.RGBAToColor(r, g, b, 255)
-        mat_indices.append(mat_group.AddMaterial(f"Color{i}", color))
-    mat_id = mat_group.GetResourceID()
+    tri_colors = _compute_tri_colors(vertices, faces, layer_height, len(colors))
 
-    # Add triangles with per-triangle material assignment
-    tri_buf = []
-    for f in faces:
-        tri = lib3mf.Triangle()
-        tri.Indices[0] = f[0]
-        tri.Indices[1] = f[1]
-        tri.Indices[2] = f[2]
-        tri_buf.append(tri)
-
-    mesh.SetGeometry(vert_buf, tri_buf)
-
-    # Assign material to each triangle based on Z centroid
-    for i, f in enumerate(faces):
-        z_centroid = (
-            float(vertices[f[0]].Z)
-            + float(vertices[f[1]].Z)
-            + float(vertices[f[2]].Z)
-        ) / 3.0
-        layer_index = int(z_centroid / layer_height)
-        prop_id = mat_indices[layer_index % len(colors)]
-
-        props = lib3mf.TriangleProperties()
-        props.ResourceID = mat_id
-        props.PropertyIDs[0] = prop_id
-        props.PropertyIDs[1] = prop_id
-        props.PropertyIDs[2] = prop_id
-        mesh.SetTriangleProperties(i, props)
-
-    # Set default property so the object is recognised as multi-material
-    mesh.SetObjectLevelProperty(mat_id, mat_indices[0])
-
-    # Add to build
-    model.AddBuildItem(mesh, wrapper.GetIdentityTransform())
-
-    # Write file
-    writer = model.QueryWriter("3mf")
-    writer.WriteToFile(filename)
-
-
-def _hex_to_rgb(hex_str: str) -> tuple[int, int, int]:
-    """Convert '#RRGGBB' to (R, G, B) ints."""
-    h = hex_str.lstrip("#")
-    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    with tempfile.NamedTemporaryFile(suffix=".3mf", delete=False) as tmp:
+        tmp_3mf = tmp.name
+    _write_basic_3mf(vertices, faces, tmp_3mf)
+    _inject_paint_colors(tmp_3mf, tri_colors, filename)
+    os.unlink(tmp_3mf)
 
 
 def main():
@@ -129,80 +185,22 @@ def main():
         default=None,
         help="Output 3MF file path (default: input with .3mf extension)",
     )
-    parser.add_argument(
-        "--tolerance",
-        type=float,
-        default=0.01,
-        help="Tessellation tolerance in mm (default: 0.01)",
-    )
     args = parser.parse_args()
 
-    # For standalone use, load STL via lib3mf, read triangles, then re-export
-    # with per-triangle materials.
-    wrapper = lib3mf.get_wrapper()
-    reader_model = wrapper.CreateModel()
-    reader = reader_model.QueryReader("stl")
-    reader.ReadFromFile(args.stl)
+    vertices, faces = _read_stl_mesh(args.stl)
+    tri_colors = _compute_tri_colors(
+        vertices, faces, args.layer_height, len(args.colors)
+    )
 
-    # Get the mesh object
-    obj_iter = reader_model.GetMeshObjects()
-    if not obj_iter.MoveNext():
-        raise RuntimeError(f"No mesh found in {args.stl}")
-    stl_mesh = obj_iter.GetCurrentMeshObject()
-
-    # Extract vertices and faces
-    vert_count = stl_mesh.GetVertexCount()
-    tri_count = stl_mesh.GetTriangleCount()
-    vertices_raw = []
-    for i in range(vert_count):
-        v = stl_mesh.GetVertex(i)
-        vertices_raw.append(v)
-    faces_raw = []
-    for i in range(tri_count):
-        t = stl_mesh.GetTriangle(i)
-        faces_raw.append(t)
-
-    # Build new model with materials
-    model = wrapper.CreateModel()
-    mesh = model.AddMeshObject()
-    mesh.SetName("part")
-    mesh.SetGeometry(vertices_raw, faces_raw)
-
-    # Create material group
-    mat_group = model.AddBaseMaterialGroup()
-    mat_indices = []
-    for i, hex_color in enumerate(args.colors):
-        r, g, b = _hex_to_rgb(hex_color)
-        color = wrapper.RGBAToColor(r, g, b, 255)
-        mat_indices.append(mat_group.AddMaterial(f"Color{i}", color))
-    mat_id = mat_group.GetResourceID()
-
-    # Assign per-triangle materials
-    for i in range(tri_count):
-        t = faces_raw[i]
-        v0 = vertices_raw[t.Indices[0]]
-        v1 = vertices_raw[t.Indices[1]]
-        v2 = vertices_raw[t.Indices[2]]
-        z_centroid = (
-            v0.Coordinates[2] + v1.Coordinates[2] + v2.Coordinates[2]
-        ) / 3.0
-        layer_index = int(z_centroid / args.layer_height)
-        prop_id = mat_indices[layer_index % len(args.colors)]
-
-        props = lib3mf.TriangleProperties()
-        props.ResourceID = mat_id
-        props.PropertyIDs[0] = prop_id
-        props.PropertyIDs[1] = prop_id
-        props.PropertyIDs[2] = prop_id
-        mesh.SetTriangleProperties(i, props)
-
-    mesh.SetObjectLevelProperty(mat_id, mat_indices[0])
-    model.AddBuildItem(mesh, wrapper.GetIdentityTransform())
+    with tempfile.NamedTemporaryFile(suffix=".3mf", delete=False) as tmp:
+        tmp_3mf = tmp.name
+    _write_basic_3mf(vertices, faces, tmp_3mf)
 
     output = args.output or args.stl.rsplit(".", 1)[0] + ".3mf"
-    writer = model.QueryWriter("3mf")
-    writer.WriteToFile(output)
-    print(f"Exported: {output} ({tri_count} triangles, {len(args.colors)} colours, {args.layer_height}mm layers)")
+    _inject_paint_colors(tmp_3mf, tri_colors, output)
+    os.unlink(tmp_3mf)
+
+    print(f"Exported: {output} ({len(faces)} triangles, {len(args.colors)} colours, {args.layer_height}mm layers)")
 
 
 if __name__ == "__main__":
