@@ -120,10 +120,15 @@ def main():
     if not args.no_view:
         try:
             from ocp_vscode import show
+            from ocp_vscode import config as _ocp_cfg
+
+            # Fix version mismatch: viewer returns int enum values but library expects str keys
+            for i, collapse in enumerate(_ocp_cfg.Collapse):
+                _ocp_cfg.COLLAPSE_REVERSE_MAPPING[i] = collapse
 
             show(holder, names=["Peg Holder"], colors=["sienna"])
             print("Displayed in OCP viewer")
-        except Exception:
+        except ImportError:
             print("OCP viewer not available, skipping display")
 
 
